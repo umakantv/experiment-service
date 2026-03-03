@@ -672,7 +672,7 @@ curl -X POST http://localhost:8080/experiments \
 
 ## 8. Evaluate Experiment
 
-### Evaluate an experiment for a new entity
+### Evaluate a ramp-up-percentage experiment for a new entity
 ```bash
 curl -X POST http://localhost:8080/experiments/1/evaluate \
   -H "Authorization: Bearer secret-token" \
@@ -702,6 +702,163 @@ curl -X POST http://localhost:8080/experiments/1/evaluate \
     "entity_type": "user",
     "entity_id": "user-123"
   }'
+```
+
+---
+
+## 8.1 Evaluate Rule-Based Experiment
+
+### Evaluate a rule-based experiment with entity attributes
+```bash
+curl -X POST http://localhost:8080/experiments/2/evaluate \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_type": "user",
+    "entity_id": "user-456",
+    "attributes": {
+      "country": "US",
+      "tier": "premium",
+      "age": 30
+    }
+  }'
+```
+
+**Expected Response (200 OK) - Rule matched with assign_variant action:**
+```json
+{
+  "experiment_id": 2,
+  "variant_name": "treatment",
+  "entity_type": "user",
+  "entity_id": "user-456",
+  "matched_rule": {
+    "priority": 1,
+    "action": "{\"action\": \"assign_variant\", \"variant\": \"treatment\"}"
+  }
+}
+```
+
+### Evaluate with attributes that don't match any rule (fallback to default)
+```bash
+curl -X POST http://localhost:8080/experiments/2/evaluate \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_type": "user",
+    "entity_id": "user-789",
+    "attributes": {
+      "country": "FR",
+      "tier": "basic"
+    }
+  }'
+```
+
+**Expected Response (200 OK) - No rule matched, fallback to control:**
+```json
+{
+  "experiment_id": 2,
+  "variant_name": "control",
+  "entity_type": "user",
+  "entity_id": "user-789"
+}
+```
+
+### Create a rule-based experiment with enable_experiment action
+```bash
+curl -X POST http://localhost:8080/experiments \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "feature-flag-with-fallback",
+    "description": "Feature flag with hash-based fallback",
+    "experiment_type": "rule-based-assignment",
+    "start_date": "2026-03-01T00:00:00Z",
+    "end_date": "2026-03-31T23:59:59Z",
+    "variants": [
+      {"name": "control", "traffic_percentage": 50},
+      {"name": "treatment", "traffic_percentage": 50}
+    ],
+    "rules": [
+      {
+        "priority": 1,
+        "condition": "country == '\''US'\'' AND tier == '\''premium'\''",
+        "action": "{\"action\": \"enable_experiment\"}"
+      },
+      {
+        "priority": 2,
+        "condition": "true",
+        "action": "{\"action\": \"assign_variant\", \"variant\": \"control\"}"
+      }
+    ]
+  }'
+```
+
+### Create a rule-based experiment with set_payload action
+```bash
+curl -X POST http://localhost:8080/experiments \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "ui-config-experiment",
+    "description": "UI configuration experiment with payload",
+    "experiment_type": "rule-based-assignment",
+    "start_date": "2026-03-01T00:00:00Z",
+    "end_date": "2026-03-31T23:59:59Z",
+    "variants": [
+      {"name": "control"},
+      {"name": "treatment"}
+    ],
+    "rules": [
+      {
+        "priority": 1,
+        "condition": "country == '\''US'\''",
+        "action": "{\"action\": \"set_payload\", \"payload\": {\"buttonColor\": \"blue\", \"timeout\": 5000, \"showBanner\": true}}"
+      },
+      {
+        "priority": 2,
+        "condition": "country == '\''EU'\''",
+        "action": "{\"action\": \"set_payload\", \"payload\": {\"buttonColor\": \"green\", \"timeout\": 3000, \"showBanner\": false}}"
+      },
+      {
+        "priority": 3,
+        "condition": "true",
+        "action": "{\"action\": \"assign_variant\", \"variant\": \"control\"}"
+      }
+    ]
+  }'
+```
+
+### Evaluate experiment with set_payload action
+```bash
+curl -X POST http://localhost:8080/experiments/3/evaluate \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_type": "user",
+    "entity_id": "user-us-123",
+    "attributes": {
+      "country": "US"
+    }
+  }'
+```
+
+**Expected Response (200 OK) - Returns payload:**
+```json
+{
+  "experiment_id": 3,
+  "variant_name": "control",
+  "entity_type": "user",
+  "entity_id": "user-us-123",
+  "payload": {
+    "buttonColor": "blue",
+    "timeout": 5000,
+    "showBanner": true
+  },
+  "matched_rule": {
+    "priority": 1,
+    "action": "{\"action\": \"set_payload\", \"payload\": {\"buttonColor\": \"blue\", \"timeout\": 5000, \"showBanner\": true}}"
+  }
+}
 ```
 
 ---

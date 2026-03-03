@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Experiment represents an A/B test experiment
 type Experiment struct {
@@ -29,13 +32,60 @@ type Variant struct {
 
 // Rule represents a prioritized condition-action pair for rule-based experiments
 type Rule struct {
-	ID           int    `json:"id" db:"id"`
-	ExperimentID int    `json:"experiment_id" db:"experiment_id"`
-	Priority     int    `json:"priority" db:"priority"`
-	Condition    string `json:"condition" db:"condition"`
-	Action       string `json:"action" db:"action"`
+	ID           int       `json:"id" db:"id"`
+	ExperimentID int       `json:"experiment_id" db:"experiment_id"`
+	Priority     int       `json:"priority" db:"priority"`
+	Condition    string    `json:"condition" db:"condition"`
+	Action       string    `json:"action" db:"action"`
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// ActionType defines the type of action a rule can perform
+type ActionType string
+
+const (
+	ActionAssignVariant   ActionType = "assign_variant"
+	ActionEnableExperiment ActionType = "enable_experiment"
+	ActionSetPayload      ActionType = "set_payload"
+)
+
+// RuleAction represents the parsed action from a rule
+type RuleAction struct {
+	Type     ActionType              `json:"type"`
+	Variant  string                  `json:"variant,omitempty"`
+	Payload  map[string]interface{}  `json:"payload,omitempty"`
+}
+
+// ParseAction parses the action string into a structured RuleAction
+func (r *Rule) ParseAction() (*RuleAction, error) {
+	var rawAction map[string]interface{}
+	if err := json.Unmarshal([]byte(r.Action), &rawAction); err != nil {
+		return nil, err
+	}
+	
+	action := &RuleAction{}
+	
+	if actionType, ok := rawAction["action"].(string); ok {
+		action.Type = ActionType(actionType)
+	} else {
+		return nil, nil // Legacy format: plain string action
+	}
+	
+	switch action.Type {
+	case ActionAssignVariant:
+		if variant, ok := rawAction["variant"].(string); ok {
+			action.Variant = variant
+		}
+	case ActionSetPayload:
+		if payload, ok := rawAction["payload"].(map[string]interface{}); ok {
+			action.Payload = payload
+		} else if value, ok := rawAction["value"].(map[string]interface{}); ok {
+			action.Payload = value
+		}
+	}
+	
+	return action, nil
 }
 
 // CreateExperimentRequest represents the request to create an experiment
@@ -92,14 +142,23 @@ type UpdateRuleRequest struct {
 
 // EvaluateRequest represents the request to evaluate an experiment
 type EvaluateRequest struct {
-	EntityType string `json:"entity_type"`
-	EntityID   string `json:"entity_id"`
+	EntityType string                 `json:"entity_type"`
+	EntityID   string                 `json:"entity_id"`
+	Attributes map[string]interface{} `json:"attributes,omitempty"`
 }
 
 // EvaluateResponse represents the response from evaluating an experiment
 type EvaluateResponse struct {
-	ExperimentID int    `json:"experiment_id"`
-	VariantName  string `json:"variant_name"`
-	EntityType   string `json:"entity_type"`
-	EntityID     string `json:"entity_id"`
+	ExperimentID   int                    `json:"experiment_id"`
+	VariantName    string                 `json:"variant_name,omitempty"`
+	EntityType     string                 `json:"entity_type"`
+	EntityID       string                 `json:"entity_id"`
+	Payload        map[string]interface{} `json:"payload,omitempty"`
+	MatchedRule    *MatchedRuleInfo       `json:"matched_rule,omitempty"`
+}
+
+// MatchedRuleInfo contains information about the matched rule
+type MatchedRuleInfo struct {
+	Priority int    `json:"priority"`
+	Action   string `json:"action"`
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"oauth-service/models"
+	"oauth-service/pkg/rule_engine"
 
 	"github.com/gorilla/mux"
 	"github.com/jmoiron/sqlx"
@@ -895,7 +896,7 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 
 	h.logRequest(ctx, "info", "Evaluating experiment", zap.Int("experiment_id", id), zap.String("entity_type", req.EntityType), zap.String("entity_id", req.EntityID))
 
-	// 1. Check if evaluation already exists for this entity and experiment
+	// 1. Check if evaluation already exists for this entity and experiment (manual override)
 	var existingVariant string
 	err = h.db.QueryRow(`
 		SELECT variant_name 
@@ -920,7 +921,7 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	// 2. Fetch experiment and variants
+	// 2. Fetch experiment
 	var exp models.Experiment
 	err = h.db.QueryRow(`
 		SELECT id, name, experiment_type, start_date, end_date 
@@ -943,35 +944,176 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 	now := time.Now()
 	if now.Before(exp.StartDate) || now.After(exp.EndDate) {
 		h.logRequest(ctx, "info", "Experiment is not active", zap.Int("experiment_id", id), zap.Time("now", now))
-		// If not active, we might return a default or error. Let's return error for now.
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(errs.NewValidationError("Experiment is not active"))
 		return
 	}
 
+	// Load variants
 	variants, err := h.getVariantsByExperimentID(id)
-	if err != nil || len(variants) == 0 {
-		h.logRequest(ctx, "error", "Failed to load variants or no variants found", zap.Error(err))
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to load variants", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load variants"))
 		return
 	}
 
-	// 4. Hash-based bucketing for assignment
+	// 4. Handle based on experiment type
+	if exp.ExperimentType == "rule-based-assignment" {
+		response, err := h.evaluateRuleBased(ctx, &exp, variants, &req)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to evaluate rule-based experiment", zap.Error(err))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError(err.Error()))
+			return
+		}
+		h.logRequest(ctx, "info", "Rule-based experiment evaluated successfully", zap.Int("experiment_id", id))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// 5. Default: Hash-based bucketing for ramp-up-percentage
+	response, err := h.evaluateHashBased(&exp, variants, &req)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to evaluate hash-based experiment", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError(err.Error()))
+		return
+	}
+
+	h.logRequest(ctx, "info", "Experiment evaluated successfully", zap.Int("experiment_id", id), zap.String("variant", response.VariantName))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// evaluateRuleBased evaluates a rule-based assignment experiment
+func (h *Handler) evaluateRuleBased(ctx context.Context, exp *models.Experiment, variants []models.Variant, req *models.EvaluateRequest) (*models.EvaluateResponse, error) {
+	// Load rules for the experiment
+	rules, err := h.getRulesByExperimentID(exp.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load rules: %w", err)
+	}
+
+	if len(rules) == 0 {
+		// No rules, fall back to hash-based assignment
+		return h.evaluateHashBased(exp, variants, req)
+	}
+
+	// Prepare attributes for rule evaluation
+	attributes := req.Attributes
+	if attributes == nil {
+		attributes = make(map[string]interface{})
+	}
+
+	// Evaluate rules in priority order (rules are already sorted by priority ASC)
+	for _, rule := range rules {
+		matched, err := rule_engine.EvaluateCondition(rule.Condition, attributes)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to evaluate rule condition", zap.Error(err), zap.Int("rule_id", rule.ID))
+			continue // Skip invalid rules
+		}
+
+		if !matched {
+			continue
+		}
+
+		// Rule matched, parse and execute action
+		action, err := rule.ParseAction()
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to parse rule action", zap.Error(err), zap.Int("rule_id", rule.ID))
+			continue
+		}
+
+		response := &models.EvaluateResponse{
+			ExperimentID: exp.ID,
+			EntityType:   req.EntityType,
+			EntityID:     req.EntityID,
+			MatchedRule: &models.MatchedRuleInfo{
+				Priority: rule.Priority,
+				Action:   rule.Action,
+			},
+		}
+
+		if action == nil {
+			// Legacy format: treat action string as variant name for backward compatibility
+			response.VariantName = rule.Action
+			return response, nil
+		}
+
+		switch action.Type {
+		case models.ActionAssignVariant:
+			// Directly assign the specified variant
+			response.VariantName = action.Variant
+			return response, nil
+
+		case models.ActionEnableExperiment:
+			// Fall through to hash-based assignment
+			hashResponse, err := h.evaluateHashBased(exp, variants, req)
+			if err != nil {
+				return nil, err
+			}
+			response.VariantName = hashResponse.VariantName
+			return response, nil
+
+		case models.ActionSetPayload:
+			// Return the payload directly
+			response.Payload = action.Payload
+			// Optionally set a default variant name
+			if len(variants) > 0 {
+				response.VariantName = variants[0].Name
+			}
+			return response, nil
+
+		default:
+			h.logRequest(ctx, "error", "Unknown action type", zap.String("action_type", string(action.Type)))
+			continue
+		}
+	}
+
+	// No rules matched, return default variant (first variant or control)
+	response := &models.EvaluateResponse{
+		ExperimentID: exp.ID,
+		EntityType:   req.EntityType,
+		EntityID:     req.EntityID,
+	}
+
+	if len(variants) > 0 {
+		// Find control variant or use first one
+		for _, v := range variants {
+			if v.Name == "control" {
+				response.VariantName = v.Name
+				return response, nil
+			}
+		}
+		response.VariantName = variants[0].Name
+	}
+
+	return response, nil
+}
+
+// evaluateHashBased performs hash-based bucketing for variant assignment
+func (h *Handler) evaluateHashBased(exp *models.Experiment, variants []models.Variant, req *models.EvaluateRequest) (*models.EvaluateResponse, error) {
+	if len(variants) == 0 {
+		return nil, fmt.Errorf("no variants found for experiment")
+	}
+
+	// Hash-based bucketing for assignment
 	// We combine experiment ID and entity ID to ensure deterministic but unique assignment per experiment
 	hasher := sha256.New()
-	hasher.Write([]byte(fmt.Sprintf("%d:%s:%s", id, req.EntityType, req.EntityID)))
+	hasher.Write([]byte(fmt.Sprintf("%d:%s:%s", exp.ID, req.EntityType, req.EntityID)))
 	hashBytes := hasher.Sum(nil)
-	
+
 	// Use the first 8 bytes of the hash to get a uint64
 	hashValue := binary.BigEndian.Uint64(hashBytes[:8])
-	
+
 	// Bucketing (0-9999 for 0.01% precision)
 	bucket := hashValue % 10000
 
 	// Normalize to 0-100 percentage space (0.01% increments)
 	percentageBucket := float64(bucket) / 100
-	
+
 	var assignedVariant string
 	var cumulativePercentage float64
 	for _, v := range variants {
@@ -987,16 +1129,12 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 		assignedVariant = variants[len(variants)-1].Name
 	}
 
-	// 5. Return the result (no persistence for hash-based evaluation)
-	h.logRequest(ctx, "info", "Experiment evaluated successfully", zap.Int("experiment_id", id), zap.String("variant", assignedVariant))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(models.EvaluateResponse{
-		ExperimentID: id,
+	return &models.EvaluateResponse{
+		ExperimentID: exp.ID,
 		VariantName:  assignedVariant,
 		EntityType:   req.EntityType,
 		EntityID:     req.EntityID,
-	})
+	}, nil
 }
 
 // CreateManualEvaluation handles POST /evaluations - manually whitelist an entity for a variant
