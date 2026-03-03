@@ -234,7 +234,7 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 		return
 	}
 
-	// Validate traffic ratio sums to 1.0
+	// Validate traffic percentage sums to 100.0
 	var totalTraffic float64
 	for _, v := range req.Variants {
 		if v.Name == "" {
@@ -243,12 +243,18 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 			json.NewEncoder(w).Encode(errs.NewValidationError("All variants must have a name"))
 			return
 		}
-		totalTraffic += v.TrafficRatio
+		if v.TrafficPercentage < 0 {
+			h.logRequest(ctx, "error", "Variant traffic percentage negative", zap.Float64("traffic_percentage", v.TrafficPercentage))
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentage must be non-negative"))
+			return
+		}
+		totalTraffic += v.TrafficPercentage
 	}
-	if totalTraffic < 0.99 || totalTraffic > 1.01 {
-		h.logRequest(ctx, "error", "Invalid traffic ratio sum", zap.Float64("total", totalTraffic))
+	if totalTraffic < 99.9 || totalTraffic > 100.1 {
+		h.logRequest(ctx, "error", "Invalid traffic percentage sum", zap.Float64("total", totalTraffic))
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errs.NewValidationError("Traffic ratios must sum to 1.0"))
+		json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentages must sum to 100"))
 		return
 	}
 
@@ -286,16 +292,44 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 	experimentID, _ := result.LastInsertId()
 
 	// Insert variants
-	for _, v := range req.Variants {
-		_, err := tx.Exec(`
-			INSERT INTO variants (experiment_id, name, description, traffic_ratio, created_at, updated_at) 
+	createdAt := time.Now()
+	updatedAt := createdAt
+	exp := models.Experiment{
+		ID:          int(experimentID),
+		Name:        req.Name,
+		Description: req.Description,
+		StartDate:   req.StartDate,
+		EndDate:     req.EndDate,
+		Variants:    make([]models.Variant, len(req.Variants)),
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
+	}
+	for index, v := range req.Variants {
+		result, err := tx.Exec(`
+			INSERT INTO variants (experiment_id, name, description, traffic_percentage, created_at, updated_at) 
 			VALUES (?, ?, ?, ?, ?, ?)`,
-			experimentID, v.Name, v.Description, v.TrafficRatio, time.Now(), time.Now())
+			experimentID, v.Name, v.Description, v.TrafficPercentage, createdAt, updatedAt)
 		if err != nil {
 			h.logRequest(ctx, "error", "Failed to create variant", zap.Error(err))
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to create variant"))
 			return
+		}
+		variantID, err := result.LastInsertId()
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to fetch variant ID", zap.Error(err))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to create variant"))
+			return
+		}
+		exp.Variants[index] = models.Variant{
+			ID:                int(variantID),
+			ExperimentID:      int(experimentID),
+			Name:              v.Name,
+			Description:       v.Description,
+			TrafficPercentage: v.TrafficPercentage,
+			CreatedAt:         createdAt,
+			UpdatedAt:         updatedAt,
 		}
 	}
 
@@ -312,26 +346,6 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 	h.logRequest(ctx, "info", "Experiment created successfully", zap.Int("experiment_id", int(experimentID)))
 
 	// Return created experiment
-	exp := models.Experiment{
-		ID:          int(experimentID),
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   req.StartDate,
-		EndDate:     req.EndDate,
-		Variants:    make([]models.Variant, len(req.Variants)),
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-	}
-	for i, v := range req.Variants {
-		exp.Variants[i] = models.Variant{
-			ExperimentID: int(experimentID),
-			Name:         v.Name,
-			Description:  v.Description,
-			TrafficRatio: v.TrafficRatio,
-			CreatedAt:    time.Now(),
-			UpdatedAt:    time.Now(),
-		}
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -382,31 +396,166 @@ func (h *Handler) UpdateExperiment(ctx context.Context, w http.ResponseWriter, r
 		args = append(args, *req.EndDate)
 	}
 
-	if len(setParts) == 0 {
+	hasExperimentUpdates := len(setParts) > 0
+	hasVariantUpdates := len(req.Variants) > 0
+
+	if !hasExperimentUpdates && !hasVariantUpdates {
 		h.logRequest(ctx, "error", "No fields to update", zap.Int("experiment_id", id))
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(errs.NewValidationError("No fields to update"))
 		return
 	}
 
-	setParts = append(setParts, "updated_at = ?")
-	args = append(args, time.Now())
-	args = append(args, id)
-
-	query := "UPDATE experiments SET " + strings.Join(setParts, ", ") + " WHERE id = ?"
-	result, err := h.db.Exec(query, args...)
+	tx, err := h.db.Begin()
 	if err != nil {
-		h.logRequest(ctx, "error", "Failed to update experiment", zap.Error(err), zap.Int("experiment_id", id))
+		h.logRequest(ctx, "error", "Failed to begin transaction", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to update experiment"))
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Database error"))
 		return
 	}
+	defer tx.Rollback()
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
+	var exists bool
+	err = tx.QueryRow("SELECT EXISTS(SELECT 1 FROM experiments WHERE id = ?)", id).Scan(&exists)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to check experiment existence", zap.Error(err), zap.Int("experiment_id", id))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Database error"))
+		return
+	}
+	if !exists {
 		h.logRequest(ctx, "info", "Experiment not found for update", zap.Int("experiment_id", id))
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(errs.NewNotFoundError("Experiment not found"))
+		return
+	}
+
+	if hasExperimentUpdates {
+		setParts = append(setParts, "updated_at = ?")
+		args = append(args, time.Now())
+		args = append(args, id)
+
+		query := "UPDATE experiments SET " + strings.Join(setParts, ", ") + " WHERE id = ?"
+		if _, err := tx.Exec(query, args...); err != nil {
+			h.logRequest(ctx, "error", "Failed to update experiment", zap.Error(err), zap.Int("experiment_id", id))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to update experiment"))
+			return
+		}
+	}
+
+	if hasVariantUpdates {
+		rows, err := tx.Query(`
+			SELECT id, traffic_percentage
+			FROM variants
+			WHERE experiment_id = ?`, id)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to load variants", zap.Error(err), zap.Int("experiment_id", id))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load variants"))
+			return
+		}
+		defer rows.Close()
+
+		currentTraffic := map[int]float64{}
+		for rows.Next() {
+			var variantID int
+			var trafficPercentage float64
+			if err := rows.Scan(&variantID, &trafficPercentage); err != nil {
+				h.logRequest(ctx, "error", "Failed to scan variants", zap.Error(err))
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load variants"))
+				return
+			}
+			currentTraffic[variantID] = trafficPercentage
+		}
+
+		if len(currentTraffic) == 0 {
+			h.logRequest(ctx, "error", "No variants found for experiment", zap.Int("experiment_id", id))
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(errs.NewValidationError("No variants found for experiment"))
+			return
+		}
+
+		updatedTraffic := map[int]float64{}
+		for variantID, trafficPercentage := range currentTraffic {
+			updatedTraffic[variantID] = trafficPercentage
+		}
+
+		for _, variantUpdate := range req.Variants {
+			if variantUpdate.ID == 0 {
+				h.logRequest(ctx, "error", "Variant update missing ID", zap.Int("experiment_id", id))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Variant ID is required"))
+				return
+			}
+			if _, ok := currentTraffic[variantUpdate.ID]; !ok {
+				h.logRequest(ctx, "error", "Variant does not belong to experiment", zap.Int("experiment_id", id), zap.Int("variant_id", variantUpdate.ID))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Variant does not belong to this experiment"))
+				return
+			}
+			if variantUpdate.TrafficPercentage != nil {
+				if *variantUpdate.TrafficPercentage < 0 {
+					h.logRequest(ctx, "error", "Variant traffic percentage negative", zap.Float64("traffic_percentage", *variantUpdate.TrafficPercentage))
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentage must be non-negative"))
+					return
+				}
+				updatedTraffic[variantUpdate.ID] = *variantUpdate.TrafficPercentage
+			}
+		}
+
+		var totalTraffic float64
+		for _, trafficPercentage := range updatedTraffic {
+			totalTraffic += trafficPercentage
+		}
+		if totalTraffic < 99.9 || totalTraffic > 100.1 {
+			h.logRequest(ctx, "error", "Invalid traffic percentage sum", zap.Float64("total", totalTraffic))
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentages must sum to 100"))
+			return
+		}
+
+		for _, variantUpdate := range req.Variants {
+			variantSetParts := []string{}
+			variantArgs := []interface{}{}
+			if variantUpdate.Name != nil {
+				variantSetParts = append(variantSetParts, "name = ?")
+				variantArgs = append(variantArgs, *variantUpdate.Name)
+			}
+			if variantUpdate.Description != nil {
+				variantSetParts = append(variantSetParts, "description = ?")
+				variantArgs = append(variantArgs, *variantUpdate.Description)
+			}
+			if variantUpdate.TrafficPercentage != nil {
+				variantSetParts = append(variantSetParts, "traffic_percentage = ?")
+				variantArgs = append(variantArgs, *variantUpdate.TrafficPercentage)
+			}
+			if len(variantSetParts) == 0 {
+				h.logRequest(ctx, "error", "Variant update missing fields", zap.Int("variant_id", variantUpdate.ID))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Variant update must include at least one field"))
+				return
+			}
+
+			variantSetParts = append(variantSetParts, "updated_at = ?")
+			variantArgs = append(variantArgs, time.Now(), variantUpdate.ID, id)
+
+			variantQuery := "UPDATE variants SET " + strings.Join(variantSetParts, ", ") + " WHERE id = ? AND experiment_id = ?"
+			if _, err := tx.Exec(variantQuery, variantArgs...); err != nil {
+				h.logRequest(ctx, "error", "Failed to update variant", zap.Error(err), zap.Int("variant_id", variantUpdate.ID))
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to update variant"))
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.logRequest(ctx, "error", "Failed to commit transaction", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to update experiment"))
 		return
 	}
 
@@ -465,7 +614,7 @@ func (h *Handler) DeleteExperiment(ctx context.Context, w http.ResponseWriter, r
 // getVariantsByExperimentID retrieves all variants for a given experiment ID
 func (h *Handler) getVariantsByExperimentID(experimentID int) ([]models.Variant, error) {
 	rows, err := h.db.Query(`
-		SELECT id, experiment_id, name, description, traffic_ratio, created_at, updated_at 
+		SELECT id, experiment_id, name, description, traffic_percentage, created_at, updated_at 
 		FROM variants 
 		WHERE experiment_id = ?
 		ORDER BY id`, experimentID)
@@ -477,7 +626,7 @@ func (h *Handler) getVariantsByExperimentID(experimentID int) ([]models.Variant,
 	var variants []models.Variant
 	for rows.Next() {
 		var v models.Variant
-		err := rows.Scan(&v.ID, &v.ExperimentID, &v.Name, &v.Description, &v.TrafficRatio, &v.CreatedAt, &v.UpdatedAt)
+		err := rows.Scan(&v.ID, &v.ExperimentID, &v.Name, &v.Description, &v.TrafficPercentage, &v.CreatedAt, &v.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -594,12 +743,15 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 	
 	// Bucketing (0-9999 for 0.01% precision)
 	bucket := hashValue % 10000
+
+	// Normalize to 0-100 percentage space (0.01% increments)
+	percentageBucket := float64(bucket) / 100
 	
 	var assignedVariant string
-	var cumulativeRatio float64
+	var cumulativePercentage float64
 	for _, v := range variants {
-		cumulativeRatio += v.TrafficRatio
-		if float64(bucket) < cumulativeRatio*10000 {
+		cumulativePercentage += v.TrafficPercentage
+		if percentageBucket < cumulativePercentage {
 			assignedVariant = v.Name
 			break
 		}

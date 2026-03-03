@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS variants (
     experiment_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     description TEXT,
-    traffic_ratio REAL NOT NULL DEFAULT 0.5,
+    traffic_percentage REAL NOT NULL DEFAULT 50.0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE,

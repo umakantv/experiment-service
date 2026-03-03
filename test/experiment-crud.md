@@ -51,12 +51,12 @@ curl -X POST http://localhost:8080/experiments \
       {
         "name": "control",
         "description": "Original blue button",
-        "traffic_ratio": 0.5
+        "traffic_percentage": 50
       },
       {
         "name": "treatment",
         "description": "New green button",
-        "traffic_ratio": 0.5
+        "traffic_percentage": 50
       }
     ]
   }'
@@ -76,7 +76,7 @@ curl -X POST http://localhost:8080/experiments \
       "experiment_id": 1,
       "name": "control",
       "description": "Original blue button",
-      "traffic_ratio": 0.5,
+      "traffic_percentage": 50,
       "created_at": "...",
       "updated_at": "..."
     },
@@ -85,7 +85,7 @@ curl -X POST http://localhost:8080/experiments \
       "experiment_id": 1,
       "name": "treatment",
       "description": "New green button",
-      "traffic_ratio": 0.5,
+      "traffic_percentage": 50,
       "created_at": "...",
       "updated_at": "..."
     }
@@ -109,20 +109,46 @@ curl -X POST http://localhost:8080/experiments \
       {
         "name": "control",
         "description": "Current layout",
-        "traffic_ratio": 0.34
+        "traffic_percentage": 34
       },
       {
         "name": "treatment-a",
         "description": "New layout with hero section",
-        "traffic_ratio": 0.33
+        "traffic_percentage": 33
       },
       {
         "name": "treatment-b",
         "description": "New layout with grid layout",
-        "traffic_ratio": 0.33
+        "traffic_percentage": 33
       }
     ]
   }'
+```
+
+### Ramp up traffic split for an experiment (update variants with experiment PUT)
+```bash
+curl -X PUT http://localhost:8080/experiments/1 \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "variants": [
+      {
+        "id": 2,
+        "traffic_percentage": 70
+      },
+      {
+        "id": 1,
+        "traffic_percentage": 30
+      }
+    ]
+  }'
+```
+
+**Expected Response (200 OK):**
+```json
+{
+  "message": "Experiment updated successfully"
+}
 ```
 
 ---
@@ -185,7 +211,7 @@ curl -X GET http://localhost:8080/experiments/1 \
       "experiment_id": 1,
       "name": "control",
       "description": "Original blue button",
-      "traffic_ratio": 0.5,
+      "traffic_percentage": 50,
       "created_at": "...",
       "updated_at": "..."
     },
@@ -194,7 +220,7 @@ curl -X GET http://localhost:8080/experiments/1 \
       "experiment_id": 1,
       "name": "treatment",
       "description": "New green button",
-      "traffic_ratio": 0.5,
+      "traffic_percentage": 50,
       "created_at": "...",
       "updated_at": "..."
     }
@@ -329,8 +355,8 @@ curl -X POST http://localhost:8080/experiments \
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [
-      {"name": "control", "traffic_ratio": 0.5},
-      {"name": "treatment", "traffic_ratio": 0.5}
+      {"name": "control", "traffic_percentage": 50},
+      {"name": "treatment", "traffic_percentage": 50}
     ]
   }'
 
@@ -343,8 +369,8 @@ curl -X POST http://localhost:8080/experiments \
     "start_date": "2026-04-01T00:00:00Z",
     "end_date": "2026-04-30T23:59:59Z",
     "variants": [
-      {"name": "control", "traffic_ratio": 0.5},
-      {"name": "treatment", "traffic_ratio": 0.5}
+      {"name": "control", "traffic_percentage": 50},
+      {"name": "treatment", "traffic_percentage": 50}
     ]
   }'
 ```
@@ -387,7 +413,7 @@ curl -X POST http://localhost:8080/experiments \
     "variants": [
       {
         "name": "control",
-        "traffic_ratio": 1.0
+        "traffic_percentage": 100
       }
     ]
   }'
@@ -401,7 +427,7 @@ curl -X POST http://localhost:8080/experiments \
 }
 ```
 
-### Create experiment with invalid traffic ratio sum
+### Create experiment with invalid traffic percentage sum
 ```bash
 curl -X POST http://localhost:8080/experiments \
   -H "Authorization: Bearer secret-token" \
@@ -413,11 +439,11 @@ curl -X POST http://localhost:8080/experiments \
     "variants": [
       {
         "name": "control",
-        "traffic_ratio": 0.5
+        "traffic_percentage": 50
       },
       {
         "name": "treatment",
-        "traffic_ratio": 0.3
+        "traffic_percentage": 30
       }
     ]
   }'
@@ -427,7 +453,7 @@ curl -X POST http://localhost:8080/experiments \
 ```json
 {
   "Code": 400,
-  "Message": "Traffic ratios must sum to 1.0"
+  "Message": "Traffic percentages must sum to 100"
 }
 ```
 
@@ -443,11 +469,11 @@ curl -X POST http://localhost:8080/experiments \
     "variants": [
       {
         "name": "control",
-        "traffic_ratio": 0.5
+        "traffic_percentage": 50
       },
       {
         "name": "treatment",
-        "traffic_ratio": 0.5
+        "traffic_percentage": 50
       }
     ]
   }'
@@ -556,7 +582,7 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/experiments \
   -H "Authorization: Bearer secret-token" \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-exp","description":"Test","start_date":"2026-03-01T00:00:00Z","end_date":"2026-03-31T23:59:59Z","variants":[{"name":"control","traffic_ratio":0.5},{"name":"treatment","traffic_ratio":0.5}]}'
+  -d '{"name":"test-exp","description":"Test","start_date":"2026-03-01T00:00:00Z","end_date":"2026-03-31T23:59:59Z","variants":[{"name":"control","traffic_percentage":50},{"name":"treatment","traffic_percentage":50}]}'
 
 # 3. List experiments
 curl -X GET http://localhost:8080/experiments \
