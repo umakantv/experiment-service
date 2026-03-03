@@ -137,6 +137,15 @@ func (p *parser) parseComparison() (expression, error) {
 		}
 		return expr, nil
 	}
+	// Handle standalone boolean literals (true/false)
+	if p.current().typ == tokenBool {
+		boolVal, err := strconv.ParseBool(p.current().value)
+		if err != nil {
+			return nil, err
+		}
+		p.advance()
+		return &literalBoolExpression{value: boolVal}, nil
+	}
 	left, err := p.parseValue()
 	if err != nil {
 		return nil, err
@@ -348,6 +357,14 @@ func (expr *unaryExpression) evaluate(attributes map[string]interface{}) (bool, 
 		return !value, nil
 	}
 	return false, fmt.Errorf("unsupported unary operator: %s", expr.operator)
+}
+
+type literalBoolExpression struct {
+	value bool
+}
+
+func (expr *literalBoolExpression) evaluate(attributes map[string]interface{}) (bool, error) {
+	return expr.value, nil
 }
 
 type comparisonExpression struct {
