@@ -89,7 +89,7 @@ func (h *Handler) ListExperiments(ctx context.Context, w http.ResponseWriter, r 
 
 	// Query experiments
 	rows, err := h.db.Query(`
-		SELECT id, name, description, start_date, end_date, created_at, updated_at 
+		SELECT id, name, description, experiment_type, start_date, end_date, created_at, updated_at 
 		FROM experiments 
 		ORDER BY created_at DESC`)
 	if err != nil {
@@ -103,7 +103,7 @@ func (h *Handler) ListExperiments(ctx context.Context, w http.ResponseWriter, r 
 	experiments := []models.Experiment{}
 	for rows.Next() {
 		var exp models.Experiment
-		err := rows.Scan(&exp.ID, &exp.Name, &exp.Description, &exp.StartDate, &exp.EndDate, &exp.CreatedAt, &exp.UpdatedAt)
+		err := rows.Scan(&exp.ID, &exp.Name, &exp.Description, &exp.ExperimentType, &exp.StartDate, &exp.EndDate, &exp.CreatedAt, &exp.UpdatedAt)
 		if err != nil {
 			h.logRequest(ctx, "error", "Failed to scan experiment", zap.Error(err))
 			continue
@@ -119,6 +119,14 @@ func (h *Handler) ListExperiments(ctx context.Context, w http.ResponseWriter, r 
 			continue
 		}
 		experiments[i].Variants = variants
+
+		// Load rules for each experiment
+		rules, err := h.getRulesByExperimentID(experiments[i].ID)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to load rules", zap.Error(err), zap.Int("experiment_id", experiments[i].ID))
+			continue
+		}
+		experiments[i].Rules = rules
 	}
 
 	// Cache the result
@@ -158,10 +166,10 @@ func (h *Handler) GetExperiment(ctx context.Context, w http.ResponseWriter, r *h
 	// Query experiment
 	var exp models.Experiment
 	err = h.db.QueryRow(`
-		SELECT id, name, description, start_date, end_date, created_at, updated_at 
+		SELECT id, name, description, experiment_type, start_date, end_date, created_at, updated_at 
 		FROM experiments 
 		WHERE id = ?`, id).
-		Scan(&exp.ID, &exp.Name, &exp.Description, &exp.StartDate, &exp.EndDate, &exp.CreatedAt, &exp.UpdatedAt)
+		Scan(&exp.ID, &exp.Name, &exp.Description, &exp.ExperimentType, &exp.StartDate, &exp.EndDate, &exp.CreatedAt, &exp.UpdatedAt)
 
 	if err == sql.ErrNoRows {
 		h.logRequest(ctx, "info", "Experiment not found", zap.Int("experiment_id", id))
@@ -182,6 +190,15 @@ func (h *Handler) GetExperiment(ctx context.Context, w http.ResponseWriter, r *h
 		h.logRequest(ctx, "error", "Failed to load variants", zap.Error(err), zap.Int("experiment_id", id))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load variants"))
+		return
+	}
+
+	// Load rules
+	exp.Rules, err = h.getRulesByExperimentID(exp.ID)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to load rules", zap.Error(err), zap.Int("experiment_id", id))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load rules"))
 		return
 	}
 
@@ -227,35 +244,87 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 		return
 	}
 
-	if len(req.Variants) < 2 {
-		h.logRequest(ctx, "error", "Not enough variants")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errs.NewValidationError("At least 2 variants are required (e.g., control and treatment)"))
-		return
+	if req.ExperimentType == "" {
+		req.ExperimentType = "ramp-up-percentage"
 	}
 
-	// Validate traffic percentage sums to 100.0
-	var totalTraffic float64
-	for _, v := range req.Variants {
-		if v.Name == "" {
-			h.logRequest(ctx, "error", "Variant missing name")
+	// Validate based on experiment type
+	if req.ExperimentType == "ramp-up-percentage" {
+		if len(req.Variants) < 2 {
+			h.logRequest(ctx, "error", "Not enough variants")
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(errs.NewValidationError("All variants must have a name"))
+			json.NewEncoder(w).Encode(errs.NewValidationError("At least 2 variants are required (e.g., control and treatment)"))
 			return
 		}
-		if v.TrafficPercentage < 0 {
-			h.logRequest(ctx, "error", "Variant traffic percentage negative", zap.Float64("traffic_percentage", v.TrafficPercentage))
+
+		// Validate traffic percentage sums to 100.0
+		var totalTraffic float64
+		for _, v := range req.Variants {
+			if v.Name == "" {
+				h.logRequest(ctx, "error", "Variant missing name")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("All variants must have a name"))
+				return
+			}
+			if v.TrafficPercentage < 0 {
+				h.logRequest(ctx, "error", "Variant traffic percentage negative", zap.Float64("traffic_percentage", v.TrafficPercentage))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentage must be non-negative"))
+				return
+			}
+			totalTraffic += v.TrafficPercentage
+		}
+		if totalTraffic < 99.9 || totalTraffic > 100.1 {
+			h.logRequest(ctx, "error", "Invalid traffic percentage sum", zap.Float64("total", totalTraffic))
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentage must be non-negative"))
+			json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentages must sum to 100"))
 			return
 		}
-		totalTraffic += v.TrafficPercentage
-	}
-	if totalTraffic < 99.9 || totalTraffic > 100.1 {
-		h.logRequest(ctx, "error", "Invalid traffic percentage sum", zap.Float64("total", totalTraffic))
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errs.NewValidationError("Traffic percentages must sum to 100"))
-		return
+	} else if req.ExperimentType == "rule-based-assignment" {
+		if len(req.Rules) == 0 {
+			h.logRequest(ctx, "error", "No rules provided for rule-based experiment")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(errs.NewValidationError("At least one rule is required for rule-based experiments"))
+			return
+		}
+		// Validate rules have unique priorities
+		priorities := make(map[int]bool)
+		for _, rule := range req.Rules {
+			if rule.Priority <= 0 {
+				h.logRequest(ctx, "error", "Invalid rule priority", zap.Int("priority", rule.Priority))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Rule priority must be a positive integer"))
+				return
+			}
+			if priorities[rule.Priority] {
+				h.logRequest(ctx, "error", "Duplicate rule priority", zap.Int("priority", rule.Priority))
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("Rule priorities must be unique"))
+				return
+			}
+			priorities[rule.Priority] = true
+			if rule.Condition == "" {
+				h.logRequest(ctx, "error", "Rule missing condition")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("All rules must have a condition"))
+				return
+			}
+			if rule.Action == "" {
+				h.logRequest(ctx, "error", "Rule missing action")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("All rules must have an action"))
+				return
+			}
+		}
+		// Variants are optional for rule-based, but if provided, validate names
+		for _, v := range req.Variants {
+			if v.Name == "" {
+				h.logRequest(ctx, "error", "Variant missing name")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errs.NewValidationError("All variants must have a name"))
+				return
+			}
+		}
 	}
 
 	h.logRequest(ctx, "info", "Creating experiment", zap.String("name", req.Name))
@@ -272,9 +341,9 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 
 	// Insert experiment
 	result, err := tx.Exec(`
-		INSERT INTO experiments (name, description, start_date, end_date, created_at, updated_at) 
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		req.Name, req.Description, req.StartDate, req.EndDate, time.Now(), time.Now())
+		INSERT INTO experiments (name, description, experiment_type, start_date, end_date, created_at, updated_at) 
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		req.Name, req.Description, req.ExperimentType, req.StartDate, req.EndDate, time.Now(), time.Now())
 	if err != nil {
 		// Check for unique constraint violation (duplicate name)
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
@@ -295,14 +364,16 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 	createdAt := time.Now()
 	updatedAt := createdAt
 	exp := models.Experiment{
-		ID:          int(experimentID),
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   req.StartDate,
-		EndDate:     req.EndDate,
-		Variants:    make([]models.Variant, len(req.Variants)),
-		CreatedAt:   createdAt,
-		UpdatedAt:   updatedAt,
+		ID:             int(experimentID),
+		Name:           req.Name,
+		Description:    req.Description,
+		ExperimentType: req.ExperimentType,
+		StartDate:      req.StartDate,
+		EndDate:        req.EndDate,
+		Variants:       make([]models.Variant, len(req.Variants)),
+		Rules:          make([]models.Rule, len(req.Rules)),
+		CreatedAt:      createdAt,
+		UpdatedAt:      updatedAt,
 	}
 	for index, v := range req.Variants {
 		result, err := tx.Exec(`
@@ -330,6 +401,36 @@ func (h *Handler) CreateExperiment(ctx context.Context, w http.ResponseWriter, r
 			TrafficPercentage: v.TrafficPercentage,
 			CreatedAt:         createdAt,
 			UpdatedAt:         updatedAt,
+		}
+	}
+
+	// Insert rules
+	for index, r := range req.Rules {
+		result, err := tx.Exec(`
+			INSERT INTO experiment_rules (experiment_id, priority, condition, action, created_at, updated_at) 
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			experimentID, r.Priority, r.Condition, r.Action, createdAt, updatedAt)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to create rule", zap.Error(err))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to create rule"))
+			return
+		}
+		ruleID, err := result.LastInsertId()
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to fetch rule ID", zap.Error(err))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to create rule"))
+			return
+		}
+		exp.Rules[index] = models.Rule{
+			ID:           int(ruleID),
+			ExperimentID: int(experimentID),
+			Priority:     r.Priority,
+			Condition:    r.Condition,
+			Action:       r.Action,
+			CreatedAt:    createdAt,
+			UpdatedAt:    updatedAt,
 		}
 	}
 
@@ -387,6 +488,10 @@ func (h *Handler) UpdateExperiment(ctx context.Context, w http.ResponseWriter, r
 		setParts = append(setParts, "description = ?")
 		args = append(args, *req.Description)
 	}
+	if req.ExperimentType != nil {
+		setParts = append(setParts, "experiment_type = ?")
+		args = append(args, *req.ExperimentType)
+	}
 	if req.StartDate != nil {
 		setParts = append(setParts, "start_date = ?")
 		args = append(args, *req.StartDate)
@@ -398,8 +503,9 @@ func (h *Handler) UpdateExperiment(ctx context.Context, w http.ResponseWriter, r
 
 	hasExperimentUpdates := len(setParts) > 0
 	hasVariantUpdates := len(req.Variants) > 0
+	hasRuleUpdates := len(req.Rules) > 0
 
-	if !hasExperimentUpdates && !hasVariantUpdates {
+	if !hasExperimentUpdates && !hasVariantUpdates && !hasRuleUpdates {
 		h.logRequest(ctx, "error", "No fields to update", zap.Int("experiment_id", id))
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(errs.NewValidationError("No fields to update"))
@@ -552,6 +658,96 @@ func (h *Handler) UpdateExperiment(ctx context.Context, w http.ResponseWriter, r
 		}
 	}
 
+	// Handle rule updates
+	if hasRuleUpdates {
+		// Load existing rules
+		rows, err := tx.Query(`
+			SELECT id, priority
+			FROM experiment_rules
+			WHERE experiment_id = ?`, id)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to load rules", zap.Error(err), zap.Int("experiment_id", id))
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load rules"))
+			return
+		}
+		defer rows.Close()
+
+		currentRules := map[int]int{} // ruleID -> priority
+		for rows.Next() {
+			var ruleID, priority int
+			if err := rows.Scan(&ruleID, &priority); err != nil {
+				h.logRequest(ctx, "error", "Failed to scan rules", zap.Error(err))
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to load rules"))
+				return
+			}
+			currentRules[ruleID] = priority
+		}
+
+		for _, ruleUpdate := range req.Rules {
+			// If ID is provided, update existing rule
+			if ruleUpdate.ID != 0 {
+				if _, ok := currentRules[ruleUpdate.ID]; !ok {
+					h.logRequest(ctx, "error", "Rule does not belong to experiment", zap.Int("experiment_id", id), zap.Int("rule_id", ruleUpdate.ID))
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(errs.NewValidationError("Rule does not belong to this experiment"))
+					return
+				}
+
+				ruleSetParts := []string{}
+				ruleArgs := []interface{}{}
+				if ruleUpdate.Priority != nil {
+					ruleSetParts = append(ruleSetParts, "priority = ?")
+					ruleArgs = append(ruleArgs, *ruleUpdate.Priority)
+				}
+				if ruleUpdate.Condition != nil {
+					ruleSetParts = append(ruleSetParts, "condition = ?")
+					ruleArgs = append(ruleArgs, *ruleUpdate.Condition)
+				}
+				if ruleUpdate.Action != nil {
+					ruleSetParts = append(ruleSetParts, "action = ?")
+					ruleArgs = append(ruleArgs, *ruleUpdate.Action)
+				}
+				if len(ruleSetParts) == 0 {
+					h.logRequest(ctx, "error", "Rule update missing fields", zap.Int("rule_id", ruleUpdate.ID))
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(errs.NewValidationError("Rule update must include at least one field"))
+					return
+				}
+
+				ruleSetParts = append(ruleSetParts, "updated_at = ?")
+				ruleArgs = append(ruleArgs, time.Now(), ruleUpdate.ID, id)
+
+				ruleQuery := "UPDATE experiment_rules SET " + strings.Join(ruleSetParts, ", ") + " WHERE id = ? AND experiment_id = ?"
+				if _, err := tx.Exec(ruleQuery, ruleArgs...); err != nil {
+					h.logRequest(ctx, "error", "Failed to update rule", zap.Error(err), zap.Int("rule_id", ruleUpdate.ID))
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to update rule"))
+					return
+				}
+			} else {
+				// Create new rule (ID not provided)
+				if ruleUpdate.Priority == nil || ruleUpdate.Condition == nil || ruleUpdate.Action == nil {
+					h.logRequest(ctx, "error", "New rule missing required fields")
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(errs.NewValidationError("New rules must have priority, condition, and action"))
+					return
+				}
+				_, err := tx.Exec(`
+					INSERT INTO experiment_rules (experiment_id, priority, condition, action, created_at, updated_at) 
+					VALUES (?, ?, ?, ?, ?, ?)`,
+					id, *ruleUpdate.Priority, *ruleUpdate.Condition, *ruleUpdate.Action, time.Now(), time.Now())
+				if err != nil {
+					h.logRequest(ctx, "error", "Failed to create rule", zap.Error(err))
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to create rule"))
+					return
+				}
+			}
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		h.logRequest(ctx, "error", "Failed to commit transaction", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
@@ -640,6 +836,35 @@ func (h *Handler) getVariantsByExperimentID(experimentID int) ([]models.Variant,
 	return variants, nil
 }
 
+// getRulesByExperimentID retrieves all rules for a given experiment ID
+func (h *Handler) getRulesByExperimentID(experimentID int) ([]models.Rule, error) {
+	rows, err := h.db.Query(`
+		SELECT id, experiment_id, priority, condition, action, created_at, updated_at 
+		FROM experiment_rules 
+		WHERE experiment_id = ?
+		ORDER BY priority ASC`, experimentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []models.Rule
+	for rows.Next() {
+		var r models.Rule
+		err := rows.Scan(&r.ID, &r.ExperimentID, &r.Priority, &r.Condition, &r.Action, &r.CreatedAt, &r.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, r)
+	}
+
+	if rules == nil {
+		rules = []models.Rule{}
+	}
+
+	return rules, nil
+}
+
 // EvaluateExperiment handles POST /experiments/{id}/evaluate - evaluate an experiment for an entity
 func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -698,9 +923,9 @@ func (h *Handler) EvaluateExperiment(ctx context.Context, w http.ResponseWriter,
 	// 2. Fetch experiment and variants
 	var exp models.Experiment
 	err = h.db.QueryRow(`
-		SELECT id, name, start_date, end_date 
+		SELECT id, name, experiment_type, start_date, end_date 
 		FROM experiments 
-		WHERE id = ?`, id).Scan(&exp.ID, &exp.Name, &exp.StartDate, &exp.EndDate)
+		WHERE id = ?`, id).Scan(&exp.ID, &exp.Name, &exp.ExperimentType, &exp.StartDate, &exp.EndDate)
 
 	if err == sql.ErrNoRows {
 		h.logRequest(ctx, "info", "Experiment not found", zap.Int("experiment_id", id))

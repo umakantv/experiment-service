@@ -6,7 +6,7 @@ This document provides curl commands to test the Experiment Service CRUD operati
 
 1. Start the service:
    ```bash
-   cd /testbed/oauth-service
+   cd /testbed/experiment-service
    go run main.go
    ```
 
@@ -37,7 +37,7 @@ curl -X GET http://localhost:8080/health
 
 ## 2. Create Experiment
 
-### Create a new experiment with control and treatment variants
+### Create a new experiment with control and treatment variants (ramp-up-percentage type)
 ```bash
 curl -X POST http://localhost:8080/experiments \
   -H "Authorization: Bearer secret-token" \
@@ -45,6 +45,7 @@ curl -X POST http://localhost:8080/experiments \
   -d '{
     "name": "button-color-test",
     "description": "Testing the impact of button color on conversion rate",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [
@@ -68,6 +69,7 @@ curl -X POST http://localhost:8080/experiments \
   "id": 1,
   "name": "button-color-test",
   "description": "Testing the impact of button color on conversion rate",
+  "experiment_type": "ramp-up-percentage",
   "start_date": "2026-03-01T00:00:00Z",
   "end_date": "2026-03-31T23:59:59Z",
   "variants": [
@@ -90,6 +92,111 @@ curl -X POST http://localhost:8080/experiments \
       "updated_at": "..."
     }
   ],
+  "rules": [],
+  "created_at": "...",
+  "updated_at": "..."
+}
+```
+
+### Create a rule-based assignment experiment
+```bash
+curl -X POST http://localhost:8080/experiments \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "premium-feature-rollout",
+    "description": "Roll out premium features based on user attributes",
+    "experiment_type": "rule-based-assignment",
+    "start_date": "2026-03-01T00:00:00Z",
+    "end_date": "2026-03-31T23:59:59Z",
+    "variants": [
+      {
+        "name": "control",
+        "description": "Default experience"
+      },
+      {
+        "name": "treatment",
+        "description": "Premium features enabled"
+      }
+    ],
+    "rules": [
+      {
+        "priority": 1,
+        "condition": "entity.attributes.country == '\''US'\'' AND entity.attributes.tier == '\''premium'\''",
+        "action": "assign_variant: '\''treatment'\''"
+      },
+      {
+        "priority": 2,
+        "condition": "entity.attributes.country == '\''US'\''",
+        "action": "assign_variant: '\''control'\''"
+      },
+      {
+        "priority": 3,
+        "condition": "true",
+        "action": "assign_variant: '\''control'\''"
+      }
+    ]
+  }'
+```
+
+**Expected Response (201 Created):**
+```json
+{
+  "id": 2,
+  "name": "premium-feature-rollout",
+  "description": "Roll out premium features based on user attributes",
+  "experiment_type": "rule-based-assignment",
+  "start_date": "2026-03-01T00:00:00Z",
+  "end_date": "2026-03-31T23:59:59Z",
+  "variants": [
+    {
+      "id": 3,
+      "experiment_id": 2,
+      "name": "control",
+      "description": "Default experience",
+      "traffic_percentage": 0,
+      "created_at": "...",
+      "updated_at": "..."
+    },
+    {
+      "id": 4,
+      "experiment_id": 2,
+      "name": "treatment",
+      "description": "Premium features enabled",
+      "traffic_percentage": 0,
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "rules": [
+    {
+      "id": 1,
+      "experiment_id": 2,
+      "priority": 1,
+      "condition": "entity.attributes.country == 'US' AND entity.attributes.tier == 'premium'",
+      "action": "assign_variant: 'treatment'",
+      "created_at": "...",
+      "updated_at": "..."
+    },
+    {
+      "id": 2,
+      "experiment_id": 2,
+      "priority": 2,
+      "condition": "entity.attributes.country == 'US'",
+      "action": "assign_variant: 'control'",
+      "created_at": "...",
+      "updated_at": "..."
+    },
+    {
+      "id": 3,
+      "experiment_id": 2,
+      "priority": 3,
+      "condition": "true",
+      "action": "assign_variant: 'control'",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
   "created_at": "...",
   "updated_at": "..."
 }
@@ -103,6 +210,7 @@ curl -X POST http://localhost:8080/experiments \
   -d '{
     "name": "homepage-layout-test",
     "description": "Testing different homepage layouts",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-15T00:00:00Z",
     "end_date": "2026-04-15T23:59:59Z",
     "variants": [
@@ -168,9 +276,11 @@ curl -X GET http://localhost:8080/experiments \
     "id": 1,
     "name": "button-color-test",
     "description": "Testing the impact of button color on conversion rate",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [...],
+    "rules": [],
     "created_at": "...",
     "updated_at": "..."
   },
@@ -178,9 +288,11 @@ curl -X GET http://localhost:8080/experiments \
     "id": 2,
     "name": "homepage-layout-test",
     "description": "Testing different homepage layouts",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-15T00:00:00Z",
     "end_date": "2026-04-15T23:59:59Z",
     "variants": [...],
+    "rules": [],
     "created_at": "...",
     "updated_at": "..."
   }
@@ -203,6 +315,7 @@ curl -X GET http://localhost:8080/experiments/1 \
   "id": 1,
   "name": "button-color-test",
   "description": "Testing the impact of button color on conversion rate",
+  "experiment_type": "ramp-up-percentage",
   "start_date": "2026-03-01T00:00:00Z",
   "end_date": "2026-03-31T23:59:59Z",
   "variants": [
@@ -225,6 +338,7 @@ curl -X GET http://localhost:8080/experiments/1 \
       "updated_at": "..."
     }
   ],
+  "rules": [],
   "created_at": "...",
   "updated_at": "..."
 }
@@ -352,6 +466,7 @@ curl -X POST http://localhost:8080/experiments \
   -H "Content-Type: application/json" \
   -d '{
     "name": "duplicate-test",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [
@@ -366,6 +481,7 @@ curl -X POST http://localhost:8080/experiments \
   -H "Content-Type: application/json" \
   -d '{
     "name": "duplicate-test",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-04-01T00:00:00Z",
     "end_date": "2026-04-30T23:59:59Z",
     "variants": [
@@ -408,6 +524,7 @@ curl -X POST http://localhost:8080/experiments \
   -H "Content-Type: application/json" \
   -d '{
     "name": "invalid-experiment",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [
@@ -434,6 +551,7 @@ curl -X POST http://localhost:8080/experiments \
   -H "Content-Type: application/json" \
   -d '{
     "name": "invalid-experiment",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-01T00:00:00Z",
     "end_date": "2026-03-31T23:59:59Z",
     "variants": [
@@ -464,6 +582,7 @@ curl -X POST http://localhost:8080/experiments \
   -H "Content-Type: application/json" \
   -d '{
     "name": "invalid-experiment",
+    "experiment_type": "ramp-up-percentage",
     "start_date": "2026-03-31T00:00:00Z",
     "end_date": "2026-03-01T23:59:59Z",
     "variants": [
@@ -484,6 +603,68 @@ curl -X POST http://localhost:8080/experiments \
 {
   "Code": 400,
   "Message": "End date must be after start date"
+}
+```
+
+### Create rule-based experiment without rules (should return error)
+```bash
+curl -X POST http://localhost:8080/experiments \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "invalid-rule-experiment",
+    "experiment_type": "rule-based-assignment",
+    "start_date": "2026-03-01T00:00:00Z",
+    "end_date": "2026-03-31T23:59:59Z",
+    "variants": [
+      {"name": "control"},
+      {"name": "treatment"}
+    ]
+  }'
+```
+
+**Expected Response (400 Bad Request):**
+```json
+{
+  "Code": 400,
+  "Message": "At least one rule is required for rule-based experiments"
+}
+```
+
+### Create rule-based experiment with duplicate priorities (should return error)
+```bash
+curl -X POST http://localhost:8080/experiments \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "invalid-rule-experiment",
+    "experiment_type": "rule-based-assignment",
+    "start_date": "2026-03-01T00:00:00Z",
+    "end_date": "2026-03-31T23:59:59Z",
+    "variants": [
+      {"name": "control"},
+      {"name": "treatment"}
+    ],
+    "rules": [
+      {
+        "priority": 1,
+        "condition": "entity.attributes.country == '\''US'\''",
+        "action": "assign_variant: '\''treatment'\''"
+      },
+      {
+        "priority": 1,
+        "condition": "true",
+        "action": "assign_variant: '\''control'\''"
+      }
+    ]
+  }'
+```
+
+**Expected Response (400 Bad Request):**
+```json
+{
+  "Code": 400,
+  "Message": "Rule priorities must be unique"
 }
 ```
 
@@ -582,7 +763,7 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/experiments \
   -H "Authorization: Bearer secret-token" \
   -H "Content-Type: application/json" \
-  -d '{"name":"test-exp","description":"Test","start_date":"2026-03-01T00:00:00Z","end_date":"2026-03-31T23:59:59Z","variants":[{"name":"control","traffic_percentage":50},{"name":"treatment","traffic_percentage":50}]}'
+  -d '{"name":"test-exp","description":"Test","experiment_type":"ramp-up-percentage","start_date":"2026-03-01T00:00:00Z","end_date":"2026-03-31T23:59:59Z","variants":[{"name":"control","traffic_percentage":50},{"name":"treatment","traffic_percentage":50}]}'
 
 # 3. List experiments
 curl -X GET http://localhost:8080/experiments \
